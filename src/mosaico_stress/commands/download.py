@@ -13,13 +13,13 @@ from mosaicolabs import MosaicoClient
 
 from mosaico_stress.connection import discover_resources, get_connect_kwargs
 from mosaico_stress.utils import (
-    DownloadOperation,
+    Operation,
     console,
-    download_size_limit_reached,
     error_console,
     parse_duration,
     parse_size,
-    print_download_report,
+    print_report,
+    size_limit_reached,
 )
 
 FLUSH_EVERY = 100
@@ -28,7 +28,7 @@ def download_worker(
     client_id: int,
     resources: List[str],
     shared_state: dict,
-    metrics_bucket: List[DownloadOperation],
+    metrics_bucket: List[Operation],
     connect_kwargs: dict,
 ) -> None:
     """Download topics in round-robin until the stop event fires."""
@@ -56,7 +56,7 @@ def download_worker(
                 msg_count += 1
 
                 if msg_count % FLUSH_EVERY == 0:
-                    if download_size_limit_reached(shared_state, bytes_received):
+                    if size_limit_reached(shared_state, bytes_received):
                         shared_state["stop_event"].set()
                         break
                     if shared_state["stop_event"].is_set():
@@ -65,10 +65,10 @@ def download_worker(
             duration = time.time() - start_time
 
             metrics_bucket.append(
-                DownloadOperation(
+                Operation(
                     client_id=client_id,
                     duration_seconds=duration,
-                    bytes_downloaded=bytes_received,
+                    bytes_transferred=bytes_received,
                     throughput_mbs=(bytes_received / (1024 * 1024)) / duration if duration > 0 else 0,
                 )
             )
@@ -76,12 +76,13 @@ def download_worker(
             with shared_state["lock"]:
                 shared_state["total_bytes"] += bytes_received
 
-            if download_size_limit_reached(shared_state):
+            if size_limit_reached(shared_state):
                 shared_state["stop_event"].set()
                 break
 
 
 app = typer.Typer(invoke_without_command=True)
+
 
 @app.callback(invoke_without_command=True)
 def download(
@@ -131,15 +132,14 @@ def download(
         "max_bytes": max_bytes,
         "lock": threading.Lock(),
     }
-    metrics_bucket: List[DownloadOperation] = []
+    metrics_bucket: List[Operation] = []
 
     def _timer():
         stop_event.wait(timeout=max_seconds)
         stop_event.set()
 
     if max_seconds:
-        timer_thread = threading.Thread(target=_timer, daemon=True)
-        timer_thread.start()
+        threading.Thread(target=_timer, daemon=True).start()
 
     start = time.time()
 
@@ -148,12 +148,9 @@ def download(
             pool.submit(download_worker, i, resources, shared_state, metrics_bucket, connect_kwargs)
             for i in range(client)
         ]
-        # Wait for stop signal
         stop_event.wait()
-
-        # Let workers finish their current iteration gracefully
         for f in futures:
             f.result()
 
     total_duration = time.time() - start
-    print_download_report(total_duration, shared_state, metrics_bucket, client, verbose, output)
+    print_report("download", total_duration, shared_state, metrics_bucket, client, verbose, output)

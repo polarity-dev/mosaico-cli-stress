@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import re
-from ast import List
 from dataclasses import dataclass
+from typing import List
 
 from rich.console import Console
 from rich.table import Table
 
-# --- Size Parsing ---
+console = Console()
+error_console = Console(stderr=True)
+
 
 _SIZE_UNITS = {
     "B": 1,
@@ -54,55 +57,36 @@ def parse_duration(dur_str: str) -> float:
     return value * _DURATION_UNITS[unit]
 
 
-def format_size(size_bytes: int) -> str:
-    """Format bytes to human-readable string."""
-    if size_bytes >= 1_000_000_000:
-        return f"{size_bytes / 1_000_000_000:.2f} GB"
-    elif size_bytes >= 1_000_000:
-        return f"{size_bytes / 1_000_000:.2f} MB"
-    elif size_bytes >= 1_000:
-        return f"{size_bytes / 1_000:.2f} KB"
-    return f"{size_bytes} B"
-
-
-def format_throughput(bytes_per_sec: float) -> str:
-    """Format throughput as human-readable MB/s or GB/s."""
-    if bytes_per_sec >= 1_000_000_000:
-        return f"{bytes_per_sec / 1_000_000_000:.2f} GB/s"
-    elif bytes_per_sec >= 1_000_000:
-        return f"{bytes_per_sec / 1_000_000:.2f} MB/s"
-    elif bytes_per_sec >= 1_000:
-        return f"{bytes_per_sec / 1_000:.2f} KB/s"
-    return f"{bytes_per_sec:.0f} B/s"
-
-
-console = Console()
-error_console = Console(stderr=True)
-
 @dataclass
-class DownloadOperation:
-    """Metrics for a single topic download pass."""
+class Operation:
+    """Metrics for a single stress test operation (upload or download)."""
+
     client_id: int
     duration_seconds: float
-    bytes_downloaded: int
+    bytes_transferred: int
     throughput_mbs: float
 
-def print_download_report(
+
+def print_report(
+    mode: str,
     total_duration: float,
     shared_state: dict,
-    metrics_bucket: List[DownloadOperation],
+    metrics_bucket: List[Operation],
     num_clients: int,
     verbose: bool,
     output: str = "table",
 ) -> None:
+    """Print stress test results. mode is 'upload' or 'download'."""
     total_bytes = shared_state["total_bytes"]
     total_mbs = total_bytes / (1024 * 1024)
     avg_throughput = total_mbs / total_duration if total_duration > 0 else 0
 
-    if output == "json":
-        import json
+    label = "uploaded" if mode == "upload" else "downloaded"
+    title = f"{'Upload' if mode == 'upload' else 'Download'} Stress Test Results"
 
+    if output == "json":
         report = {
+            "mode": mode,
             "duration_seconds": round(total_duration, 3),
             "total_bytes": total_bytes,
             "total_mb": round(total_mbs, 2),
@@ -112,7 +96,7 @@ def print_download_report(
             "details": [
                 {
                     "client_id": op.client_id,
-                    "bytes_downloaded": op.bytes_downloaded,
+                    "bytes_transferred": op.bytes_transferred,
                     "duration_seconds": round(op.duration_seconds, 3),
                     "throughput_mbs": round(op.throughput_mbs, 2),
                 }
@@ -123,32 +107,34 @@ def print_download_report(
         return
 
     console.print()
-    console.print("[bold green]═══ Download Stress Test Results ═══[/bold green]")
+    console.print(f"[bold green]═══ {title} ═══[/bold green]")
     console.print(f"  Duration:         {total_duration:.2f}s")
-    console.print(f"  Total downloaded: {total_mbs:.2f} MB")
+    console.print(f"  Total {label}: {total_mbs:.2f} MB")
     console.print(f"  Avg throughput:   {avg_throughput:.2f} MB/s")
     console.print(f"  Clients:          {num_clients}")
     console.print(f"  Operations:       {len(metrics_bucket)}")
     console.print()
 
     if verbose and metrics_bucket:
+        col_label = "Uploaded" if mode == "upload" else "Downloaded"
         table = Table(title="Per-operation breakdown")
         table.add_column("Client", style="cyan")
-        table.add_column("Downloaded", style="green")
+        table.add_column(col_label, style="green")
         table.add_column("Duration", style="yellow")
         table.add_column("Throughput", style="magenta")
 
         for op in metrics_bucket:
             table.add_row(
                 str(op.client_id),
-                f"{op.bytes_downloaded / (1024 * 1024):.2f} MB",
+                f"{op.bytes_transferred / (1024 * 1024):.2f} MB",
                 f"{op.duration_seconds:.2f}s",
                 f"{op.throughput_mbs:.2f} MB/s",
             )
         console.print(table)
 
-def download_size_limit_reached(shared_state: dict, pending: int = 0) -> bool:
-    """Check whether the cumulative download has hit the size cap."""
+
+def size_limit_reached(shared_state: dict, pending: int = 0) -> bool:
+    """Check whether the cumulative transfer has hit the size cap."""
     max_bytes = shared_state["max_bytes"]
     if not max_bytes:
         return False
